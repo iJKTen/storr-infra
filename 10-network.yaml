@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr networking — VPC, public subnets, security groups
+
+Resources:
+
+  # --- VPC ---
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: storr-vpc
+        - Key: Project
+          Value: storr
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: storr-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public Subnets ---
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: storr-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: storr-public-b
+
+  # --- Route Table ---
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: storr-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Security Groups ---
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS and HTTP inbound to the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: storr-alb-sg
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks, inbound from ALB and Lambda, outbound all
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9292
+          ToPort: 9292
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: storr-fargate-sg
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS, allow NFS from Fargate tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref FargateSecurityGroup
+      Tags:
+        - Key: Name
+          Value: storr-efs-sg
+
+  # --- SSM Parameters ---
+
+  VpcIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/vpc/id
+      Type: String
+      Value: !Ref Vpc
+
+  PublicSubnetAParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/subnet/public-a
+      Type: String
+      Value: !Ref PublicSubnetA
+
+  PublicSubnetBParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/subnet/public-b
+      Type: String
+      Value: !Ref PublicSubnetB
+
+  AlbSgParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/sg/alb
+      Type: String
+      Value: !Ref AlbSecurityGroup
+
+  FargateSgParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/sg/fargate
+      Type: String
+      Value: !Ref FargateSecurityGroup
+
+  EfsSgParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/sg/efs
+      Type: String
+      Value: !Ref EfsSecurityGroup

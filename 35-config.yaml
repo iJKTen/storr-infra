@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr config - Secrets Manager secrets for credentials, SSM parameters for non-sensitive config
+
+Parameters:
+  FigmaRedirectUri:
+    Type: String
+    Default: https://api.storr.build/oauth/figma/callback
+    Description: Figma OAuth redirect URI
+  ShopifyRedirectUri:
+    Type: String
+    Default: https://api.storr.build/oauth/shopify/callback
+    Description: Shopify OAuth redirect URI
+  LlmModel:
+    Type: String
+    Default: claude-opus-5
+    Description: Model name for AI code generation
+  LlmProvider:
+    Type: String
+    Default: anthropic
+    Description: LLM provider (anthropic, openai, ollama)
+
+Resources:
+
+  # --- Secrets Manager Secrets ---
+
+  FigmaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: storr/figma
+      Description: Figma OAuth credentials
+      KmsKeyId: '{{resolve:ssm:/storr/kms/key-arn}}'
+      GenerateSecretString:
+        SecretStringTemplate: '{"client_id":"placeholder","client_secret":"placeholder"}'
+        GenerateStringKey: client_secret
+        ExcludePunctuation: true
+
+  ShopifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: storr/shopify
+      Description: Shopify OAuth credentials
+      KmsKeyId: '{{resolve:ssm:/storr/kms/key-arn}}'
+      GenerateSecretString:
+        SecretStringTemplate: '{"client_id":"placeholder","client_secret":"placeholder"}'
+        GenerateStringKey: client_secret
+        ExcludePunctuation: true
+
+  AnthropicSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: storr/anthropic
+      Description: Anthropic API key for AI code generation
+      KmsKeyId: '{{resolve:ssm:/storr/kms/key-arn}}'
+      GenerateSecretString:
+        SecretStringTemplate: '{"api_key":"placeholder"}'
+        GenerateStringKey: api_key
+        ExcludePunctuation: true
+
+  RuntimeAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: storr/runtime-auth
+      Description: Shared auth token between storr-api and runtime containers
+      KmsKeyId: '{{resolve:ssm:/storr/kms/key-arn}}'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: token
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # --- SSM Parameters (non-sensitive config) ---
+
+  FigmaRedirectUriParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/figma-redirect-uri
+      Type: String
+      Value: !Ref FigmaRedirectUri
+
+  ShopifyRedirectUriParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/shopify-redirect-uri
+      Type: String
+      Value: !Ref ShopifyRedirectUri
+
+  LlmModelParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/llm-model
+      Type: String
+      Value: !Ref LlmModel
+
+  LlmProviderParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/llm-provider
+      Type: String
+      Value: !Ref LlmProvider
+
+  # --- SSM Parameters (secret ARNs for downstream consumption) ---
+
+  FigmaSecretArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/secrets/figma-arn
+      Type: String
+      Value: !Ref FigmaSecret
+
+  ShopifySecretArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/secrets/shopify-arn
+      Type: String
+      Value: !Ref ShopifySecret
+
+  AnthropicSecretArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/secrets/anthropic-arn
+      Type: String
+      Value: !Ref AnthropicSecret
+
+  RuntimeAuthSecretArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/secrets/runtime-auth-arn
+      Type: String
+      Value: !Ref RuntimeAuthSecret

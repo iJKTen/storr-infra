@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr foundation - ECR repositories, CodeArtifact, KMS key, S3 eve-source bucket
+
+Parameters:
+  StorrBuildHostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for storr.build domain
+
+Resources:
+
+  # --- ACM Certificate ---
+  #
+  # The storr.build wildcard certificate is owned by the standalone
+  # storr-cert-infra stack, not here. It is a shared resource consumed by both
+  # the app (this repo) and the storr-saas marketing site, so it cannot live in
+  # either app's stack without coupling the two. Both apps read its ARN from the
+  # SSM parameter /storr/acm/cert-arn, which storr-cert-infra publishes. Deploy
+  # storr-cert-infra before this stack. See docs/adr/0005-consume-shared-acm-certificate.md.
+
+  # --- ECR Repositories ---
+
+  StudioEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: storr-studio
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt KmsKey.Arn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["latest"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: storr
+
+  PipelineEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: storr-pipeline
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt KmsKey.Arn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["latest"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- KMS Key ---
+
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Storr envelope encryption key
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowAWSServiceEncryption
+            Effect: Allow
+            Principal:
+              Service:
+                - ecr.amazonaws.com
+                - s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+          - Sid: AllowCloudFormationGitSyncGrants
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/StorrGitSyncRole
+            Action:
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: 'true'
+          - Sid: AllowCloudFormationGitSyncEncryption
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/StorrGitSyncRole
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:Encrypt
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: storr
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/storr
+      TargetKeyId: !Ref KmsKey
+
+  # --- CodeArtifact ---
+
+  CodeArtifactDomain:
+    Type: AWS::CodeArtifact::Domain
+    Properties:
+      DomainName: jaik
+
+  NpmjsUpstreamRepository:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      DomainName: !GetAtt CodeArtifactDomain.Name
+      RepositoryName: npmjs-store
+      ExternalConnections:
+        - public:npmjs
+
+  StorrCodeArtifactRepository:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      DomainName: !GetAtt CodeArtifactDomain.Name
+      RepositoryName: storr
+      Upstreams:
+        - !GetAtt NpmjsUpstreamRepository.Name
+
+  # --- S3 Eve Source Bucket ---
+
+  EveSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- Eve Source Bucket Cleanup on Stack Deletion ---
+
+  EmptyEveSourceBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-empty-eve-source-bucket
+      RetentionInDays: 7
+
+  EmptyEveSourceBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: EmptyBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt EveSourceBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${EveSourceBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${EmptyEveSourceBucketLogGroup.Arn}:*'
+
+  EmptyEveSourceBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt EmptyEveSourceBucketRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EmptyEveSourceBucketLogGroup
+      Code:
+        ZipFile: |
+          const { S3Client, ListObjectVersionsCommand, DeleteObjectsCommand } = require("@aws-sdk/client-s3");
+          const https = require("https");
+          const url = require("url");
+
+          function sendResponse(event, context, status, reason) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: reason || `See CloudWatch Log Stream: ${context.logStreamName}`,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+            });
+            const parsed = url.parse(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: parsed.hostname,
+                port: 443,
+                path: parsed.path,
+                method: "PUT",
+                headers: { "Content-Type": "", "Content-Length": body.length },
+              }, (res) => resolve());
+              req.on("error", reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event, context) => {
+            if (event.RequestType !== "Delete") {
+              return sendResponse(event, context, "SUCCESS");
+            }
+            try {
+              const bucket = event.ResourceProperties.BucketName;
+              const s3 = new S3Client();
+              let keyMarker, versionIdMarker;
+              do {
+                const resp = await s3.send(new ListObjectVersionsCommand({
+                  Bucket: bucket, KeyMarker: keyMarker, VersionIdMarker: versionIdMarker,
+                }));
+                const objects = [];
+                for (const v of (resp.Versions || [])) objects.push({ Key: v.Key, VersionId: v.VersionId });
+                for (const m of (resp.DeleteMarkers || [])) objects.push({ Key: m.Key, VersionId: m.VersionId });
+                if (objects.length > 0) {
+                  await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
+                }
+                keyMarker = resp.IsTruncated ? resp.NextKeyMarker : undefined;
+                versionIdMarker = resp.IsTruncated ? resp.NextVersionIdMarker : undefined;
+              } while (keyMarker);
+              return sendResponse(event, context, "SUCCESS");
+            } catch (e) {
+              console.error("Error emptying bucket:", e);
+              return sendResponse(event, context, "FAILED", e.message);
+            }
+          };
+
+  EmptyEveSourceBucketOnDelete:
+    Type: Custom::EmptyS3Bucket
+    DependsOn: EmptyEveSourceBucketLogGroup
+    Properties:
+      ServiceToken: !GetAtt EmptyEveSourceBucketFunction.Arn
+      BucketName: !Ref EveSourceBucket
+
+  # --- SSM Parameters ---
+
+  # /storr/acm/cert-arn is published by storr-cert-infra (the certificate owner),
+  # not here. This stack and its consumers resolve it via {{resolve:ssm}}.
+
+  HostedZoneIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/acm/hosted-zone-id
+      Type: String
+      Value: !Ref StorrBuildHostedZoneId
+
+  KmsKeyArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/kms/key-arn
+      Type: String
+      Value: !GetAtt KmsKey.Arn
+
+  StudioRepoUriParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecr/studio-repo-uri
+      Type: String
+      Value: !GetAtt StudioEcrRepo.RepositoryUri
+
+  StudioRepoArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecr/studio-repo-arn
+      Type: String
+      Value: !GetAtt StudioEcrRepo.Arn
+
+  PipelineRepoUriParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecr/pipeline-repo-uri
+      Type: String
+      Value: !GetAtt PipelineEcrRepo.RepositoryUri
+
+  PipelineRepoArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecr/pipeline-repo-arn
+      Type: String
+      Value: !GetAtt PipelineEcrRepo.Arn
+
+  CodeArtifactDomainNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/codeartifact/domain-name
+      Type: String
+      Value: !GetAtt CodeArtifactDomain.Name
+
+  CodeArtifactDomainArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/codeartifact/domain-arn
+      Type: String
+      Value: !GetAtt CodeArtifactDomain.Arn
+
+  CodeArtifactStorrRepoArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/codeartifact/storr-repo-arn
+      Type: String
+      Value: !GetAtt StorrCodeArtifactRepository.Arn
+
+  CodeArtifactStorrRepoEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/codeartifact/storr-repo-endpoint
+      Type: String
+      Value: !Sub 'https://jaik-${AWS::AccountId}.d.codeartifact.${AWS::Region}.amazonaws.com/npm/storr/'
+
+  EveSourceBucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/s3/eve-source-bucket-name
+      Type: String
+      Value: !Ref EveSourceBucket
+
+  EveSourceBucketArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/s3/eve-source-bucket-arn
+      Type: String
+      Value: !GetAtt EveSourceBucket.Arn

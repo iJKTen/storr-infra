@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Storr Git Sync IAM role and customer-managed policies.
+  Manually deployed (not via Git Sync) because the role is a prerequisite for Git Sync itself.
+
+Resources:
+
+  # --- Customer-Managed Policies ---
+
+  StorrNetworkAndComputePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: StorrNetworkAndComputePolicy
+      Description: EC2 networking, ECS, ECR, EFS, and ELBv2 permissions for Storr Git Sync
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Ec2Networking
+            Effect: Allow
+            Action:
+              - 'ec2:CreateVpc'
+              - 'ec2:DeleteVpc'
+              - 'ec2:DescribeVpcs'
+              - 'ec2:ModifyVpcAttribute'
+              - 'ec2:CreateSubnet'
+              - 'ec2:DeleteSubnet'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:CreateInternetGateway'
+              - 'ec2:DeleteInternetGateway'
+              - 'ec2:DescribeInternetGateways'
+              - 'ec2:AttachInternetGateway'
+              - 'ec2:DetachInternetGateway'
+              - 'ec2:CreateRouteTable'
+              - 'ec2:DeleteRouteTable'
+              - 'ec2:DescribeRouteTables'
+              - 'ec2:CreateRoute'
+              - 'ec2:DeleteRoute'
+              - 'ec2:AssociateRouteTable'
+              - 'ec2:DisassociateRouteTable'
+              - 'ec2:CreateSecurityGroup'
+              - 'ec2:DeleteSecurityGroup'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:AuthorizeSecurityGroupIngress'
+              - 'ec2:RevokeSecurityGroupIngress'
+              - 'ec2:AuthorizeSecurityGroupEgress'
+              - 'ec2:RevokeSecurityGroupEgress'
+              - 'ec2:CreateTags'
+              - 'ec2:DeleteTags'
+              - 'ec2:DescribeAvailabilityZones'
+              - 'ec2:ModifySubnetAttribute'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeAccountAttributes'
+            Resource: '*'
+          - Sid: EcsManagement
+            Effect: Allow
+            Action:
+              - 'ecs:CreateCluster'
+              - 'ecs:DeleteCluster'
+              - 'ecs:DescribeClusters'
+              - 'ecs:UpdateCluster'
+              - 'ecs:RegisterTaskDefinition'
+              - 'ecs:DeregisterTaskDefinition'
+              - 'ecs:DescribeTaskDefinition'
+              - 'ecs:CreateService'
+              - 'ecs:UpdateService'
+              - 'ecs:DeleteService'
+              - 'ecs:DescribeServices'
+              - 'ecs:TagResource'
+            Resource: '*'
+          - Sid: EcrManagement
+            Effect: Allow
+            Action:
+              - 'ecr:CreateRepository'
+              - 'ecr:DeleteRepository'
+              - 'ecr:DescribeRepositories'
+              - 'ecr:PutLifecyclePolicy'
+              - 'ecr:PutImageScanningConfiguration'
+              - 'ecr:SetRepositoryPolicy'
+              - 'ecr:GetRepositoryPolicy'
+              - 'ecr:DeleteRepositoryPolicy'
+              - 'ecr:TagResource'
+              - 'ecr:BatchDeleteImage'
+              - 'ecr:ListImages'
+            Resource: '*'
+          - Sid: EfsManagement
+            Effect: Allow
+            Action:
+              - 'elasticfilesystem:CreateFileSystem'
+              - 'elasticfilesystem:DeleteFileSystem'
+              - 'elasticfilesystem:DescribeFileSystems'
+              - 'elasticfilesystem:DescribeFileSystemPolicy'
+              - 'elasticfilesystem:DescribeBackupPolicy'
+              - 'elasticfilesystem:DescribeReplicationConfigurations'
+              - 'elasticfilesystem:CreateMountTarget'
+              - 'elasticfilesystem:DeleteMountTarget'
+              - 'elasticfilesystem:DescribeMountTargets'
+              - 'elasticfilesystem:DescribeAccessPoints'
+              - 'elasticfilesystem:DescribeLifecycleConfiguration'
+              - 'elasticfilesystem:PutLifecycleConfiguration'
+              - 'elasticfilesystem:UpdateFileSystem'
+              - 'elasticfilesystem:TagResource'
+            Resource: '*'
+          - Sid: WafManagement
+            Effect: Allow
+            Action:
+              - 'wafv2:CreateWebACL'
+              - 'wafv2:DeleteWebACL'
+              - 'wafv2:UpdateWebACL'
+              - 'wafv2:GetWebACL'
+              - 'wafv2:ListWebACLs'
+              - 'wafv2:AssociateWebACL'
+              - 'wafv2:DisassociateWebACL'
+              - 'wafv2:GetWebACLForResource'
+              - 'wafv2:ListTagsForResource'
+              - 'wafv2:TagResource'
+              - 'wafv2:UntagResource'
+            Resource: '*'
+          - Sid: ElbManagement
+            Effect: Allow
+            Action:
+              - 'elasticloadbalancing:CreateLoadBalancer'
+              - 'elasticloadbalancing:DeleteLoadBalancer'
+              - 'elasticloadbalancing:DescribeLoadBalancers'
+              - 'elasticloadbalancing:DescribeLoadBalancerAttributes'
+              - 'elasticloadbalancing:ModifyLoadBalancerAttributes'
+              - 'elasticloadbalancing:SetSecurityGroups'
+              - 'elasticloadbalancing:CreateListener'
+              - 'elasticloadbalancing:DeleteListener'
+              - 'elasticloadbalancing:DescribeListeners'
+              - 'elasticloadbalancing:DescribeListenerCertificates'
+              - 'elasticloadbalancing:ModifyListener'
+              - 'elasticloadbalancing:CreateTargetGroup'
+              - 'elasticloadbalancing:DeleteTargetGroup'
+              - 'elasticloadbalancing:DescribeTargetGroups'
+              - 'elasticloadbalancing:ModifyTargetGroup'
+              - 'elasticloadbalancing:DescribeTargetGroupAttributes'
+              - 'elasticloadbalancing:ModifyTargetGroupAttributes'
+              - 'elasticloadbalancing:DescribeTargetHealth'
+              - 'elasticloadbalancing:CreateRule'
+              - 'elasticloadbalancing:DeleteRule'
+              - 'elasticloadbalancing:DescribeRules'
+              - 'elasticloadbalancing:ModifyRule'
+              - 'elasticloadbalancing:SetRulePriorities'
+              - 'elasticloadbalancing:SetWebACL'
+              - 'elasticloadbalancing:AddTags'
+              - 'elasticloadbalancing:RemoveTags'
+              - 'elasticloadbalancing:DescribeTags'
+            Resource: '*'
+
+  StorrDataAndAppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: StorrDataAndAppPolicy
+      Description: DynamoDB, Cognito, KMS, ACM, Lambda, and API Gateway V2 permissions for Storr Git Sync
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DynamoDbManagement
+            Effect: Allow
+            Action:
+              - 'dynamodb:CreateTable'
+              - 'dynamodb:DeleteTable'
+              - 'dynamodb:DescribeTable'
+              - 'dynamodb:UpdateTable'
+              - 'dynamodb:DescribeContinuousBackups'
+              - 'dynamodb:UpdateContinuousBackups'
+              - 'dynamodb:DescribeTimeToLive'
+              - 'dynamodb:UpdateTimeToLive'
+              - 'dynamodb:TagResource'
+              - 'dynamodb:UntagResource'
+              - 'dynamodb:ListTagsOfResource'
+            Resource: '*'
+          - Sid: CognitoManagement
+            Effect: Allow
+            Action:
+              - 'cognito-idp:CreateUserPool'
+              - 'cognito-idp:DeleteUserPool'
+              - 'cognito-idp:DescribeUserPool'
+              - 'cognito-idp:UpdateUserPool'
+              - 'cognito-idp:GetUserPoolMfaConfig'
+              - 'cognito-idp:SetUserPoolMfaConfig'
+              - 'cognito-idp:CreateUserPoolClient'
+              - 'cognito-idp:DeleteUserPoolClient'
+              - 'cognito-idp:DescribeUserPoolClient'
+              - 'cognito-idp:UpdateUserPoolClient'
+              - 'cognito-idp:ListTagsForResource'
+              - 'cognito-idp:TagResource'
+              - 'cognito-idp:UntagResource'
+            Resource: '*'
+          - Sid: KmsManagement
+            Effect: Allow
+            Action:
+              - 'kms:CreateKey'
+              - 'kms:DescribeKey'
+              - 'kms:EnableKeyRotation'
+              - 'kms:GetKeyPolicy'
+              - 'kms:GetKeyRotationStatus'
+              - 'kms:ListResourceTags'
+              - 'kms:PutKeyPolicy'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+              - 'kms:CreateAlias'
+              - 'kms:DeleteAlias'
+              - 'kms:UpdateAlias'
+              - 'kms:ListAliases'
+            Resource: '*'
+          - Sid: AcmManagement
+            Effect: Allow
+            Action:
+              - 'acm:DescribeCertificate'
+              - 'acm:ListCertificates'
+              - 'acm:RequestCertificate'
+              - 'acm:AddTagsToCertificate'
+              - 'acm:DeleteCertificate'
+            Resource: '*'
+          - Sid: LambdaManagement
+            Effect: Allow
+            Action:
+              - 'lambda:CreateFunction'
+              - 'lambda:DeleteFunction'
+              - 'lambda:GetFunction'
+              - 'lambda:GetFunctionConfiguration'
+              - 'lambda:UpdateFunctionCode'
+              - 'lambda:UpdateFunctionConfiguration'
+              - 'lambda:TagResource'
+              - 'lambda:UntagResource'
+              - 'lambda:ListTags'
+              - 'lambda:AddPermission'
+              - 'lambda:RemovePermission'
+              - 'lambda:GetPolicy'
+              - 'lambda:CreateEventSourceMapping'
+              - 'lambda:DeleteEventSourceMapping'
+              - 'lambda:GetEventSourceMapping'
+              - 'lambda:UpdateEventSourceMapping'
+              - 'lambda:ListEventSourceMappings'
+              - 'lambda:InvokeFunction'
+            Resource: '*'
+          - Sid: ApiGatewayV2Management
+            Effect: Allow
+            Action:
+              - 'apigateway:GET'
+              - 'apigateway:POST'
+              - 'apigateway:PUT'
+              - 'apigateway:PATCH'
+              - 'apigateway:DELETE'
+              - 'apigateway:TagResource'
+              - 'apigateway:UntagResource'
+              - 'apigateway:GetTags'
+            Resource: '*'
+          - Sid: SecretsManagerManagement
+            Effect: Allow
+            Action:
+              - 'secretsmanager:CreateSecret'
+              - 'secretsmanager:DeleteSecret'
+              - 'secretsmanager:DescribeSecret'
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:PutSecretValue'
+              - 'secretsmanager:UpdateSecret'
+              - 'secretsmanager:TagResource'
+              - 'secretsmanager:UntagResource'
+              - 'secretsmanager:GetResourcePolicy'
+              - 'secretsmanager:PutResourcePolicy'
+              - 'secretsmanager:DeleteResourcePolicy'
+              - 'secretsmanager:GetRandomPassword'
+            Resource: '*'
+
+  StorrDeliveryAndObservabilityPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: StorrDeliveryAndObservabilityPolicy
+      Description: CloudFront, Route 53, CodeBuild, CodeArtifact, CodeConnections, and CloudWatch permissions for Storr Git Sync
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontManagement
+            Effect: Allow
+            Action:
+              - 'cloudfront:GetFunction'
+              - 'cloudfront:CreateFunction'
+              - 'cloudfront:DeleteFunction'
+              - 'cloudfront:DescribeFunction'
+              - 'cloudfront:PublishFunction'
+              - 'cloudfront:UpdateFunction'
+              - 'cloudfront:CreateOriginAccessControl'
+              - 'cloudfront:GetOriginAccessControl'
+              - 'cloudfront:UpdateOriginAccessControl'
+              - 'cloudfront:DeleteOriginAccessControl'
+              - 'cloudfront:CreateDistribution'
+              - 'cloudfront:GetDistribution'
+              - 'cloudfront:UpdateDistribution'
+              - 'cloudfront:DeleteDistribution'
+              - 'cloudfront:CreateResponseHeadersPolicy'
+              - 'cloudfront:GetResponseHeadersPolicy'
+              - 'cloudfront:UpdateResponseHeadersPolicy'
+              - 'cloudfront:DeleteResponseHeadersPolicy'
+              - 'cloudfront:TagResource'
+              - 'cloudfront:ListTagsForResource'
+            Resource: '*'
+          - Sid: Route53Management
+            Effect: Allow
+            Action:
+              - 'route53:CreateHostedZone'
+              - 'route53:GetHostedZone'
+              - 'route53:ChangeResourceRecordSets'
+              - 'route53:ListResourceRecordSets'
+              - 'route53:ListHostedZones'
+              - 'route53:GetChange'
+            Resource: '*'
+          - Sid: CodeBuildManagement
+            Effect: Allow
+            Action:
+              - 'codebuild:UpdateProject'
+              - 'codebuild:CreateProject'
+              - 'codebuild:DeleteProject'
+              - 'codebuild:BatchGetProjects'
+            Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/*'
+          - Sid: CodeArtifactManagement
+            Effect: Allow
+            Action:
+              - 'codeartifact:*'
+            Resource: '*'
+          - Sid: CodeConnectionsManagement
+            Effect: Allow
+            Action:
+              - 'codeconnections:PassConnection'
+              - 'codeconnections:UseConnection'
+              - 'codestar-connections:PassConnection'
+              - 'codestar-connections:UseConnection'
+            Resource: !Sub 'arn:aws:codeconnections:${AWS::Region}:${AWS::AccountId}:connection/*'
+          - Sid: CloudWatchManagement
+            Effect: Allow
+            Action:
+              - 'cloudwatch:PutMetricAlarm'
+              - 'cloudwatch:DeleteAlarms'
+              - 'cloudwatch:DescribeAlarms'
+              - 'cloudwatch:TagResource'
+              - 'cloudwatch:UntagResource'
+              - 'cloudwatch:ListTagsForResource'
+              - 'cloudwatch:PutDashboard'
+              - 'cloudwatch:DeleteDashboards'
+              - 'cloudwatch:GetDashboard'
+              - 'cloudwatch:ListDashboards'
+            Resource: '*'
+          - Sid: SnsManagement
+            Effect: Allow
+            Action:
+              - 'sns:CreateTopic'
+              - 'sns:DeleteTopic'
+              - 'sns:GetTopicAttributes'
+              - 'sns:SetTopicAttributes'
+              - 'sns:Subscribe'
+              - 'sns:Unsubscribe'
+              - 'sns:TagResource'
+              - 'sns:UntagResource'
+              - 'sns:ListTagsForResource'
+            Resource: '*'
+          - Sid: EventBridgeGitSyncRules
+            Effect: Allow
+            Action:
+              - 'events:PutRule'
+              - 'events:PutTargets'
+              - 'events:DeleteRule'
+              - 'events:RemoveTargets'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'events:ManagedBy': 'cloudformation.sync.codeconnections.amazonaws.com'
+          - Sid: EventBridgeDescribeRule
+            Effect: Allow
+            Action:
+              - 'events:DescribeRule'
+            Resource: '*'
+
+  StorrCoreServicesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: StorrCoreServicesPolicy
+      Description: CloudFormation, S3, IAM, and CodePipeline permissions for Storr Git Sync
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormationManagement
+            Effect: Allow
+            Action:
+              - 'cloudformation:CreateStack'
+              - 'cloudformation:UpdateStack'
+              - 'cloudformation:DeleteStack'
+              - 'cloudformation:CreateChangeSet'
+              - 'cloudformation:ExecuteChangeSet'
+              - 'cloudformation:DescribeStacks'
+              - 'cloudformation:DescribeStackEvents'
+              - 'cloudformation:DescribeStackResources'
+              - 'cloudformation:GetTemplate'
+              - 'cloudformation:GetTemplateSummary'
+              - 'cloudformation:ListStackResources'
+              - 'cloudformation:DeleteChangeSet'
+              - 'cloudformation:DescribeChangeSet'
+              - 'cloudformation:ListChangeSets'
+              - 'cloudformation:SetStackPolicy'
+              - 'cloudformation:ValidateTemplate'
+              - 'cloudformation:GetStackPolicy'
+              - 'cloudformation:TagResource'
+              - 'cloudformation:UntagResource'
+              - 'cloudformation:ContinueUpdateRollback'
+              - 'cloudformation:RollbackStack'
+              - 'cloudformation:CancelUpdateStack'
+            Resource: '*'
+          - Sid: S3Management
+            Effect: Allow
+            Action:
+              - 's3:CreateBucket'
+              - 's3:DeleteBucket'
+              - 's3:GetBucketPolicy'
+              - 's3:PutBucketPolicy'
+              - 's3:DeleteBucketPolicy'
+              - 's3:GetBucketVersioning'
+              - 's3:PutBucketVersioning'
+              - 's3:GetEncryptionConfiguration'
+              - 's3:PutEncryptionConfiguration'
+              - 's3:GetBucketPublicAccessBlock'
+              - 's3:PutBucketPublicAccessBlock'
+              - 's3:GetBucketTagging'
+              - 's3:PutBucketTagging'
+              - 's3:GetLifecycleConfiguration'
+              - 's3:PutLifecycleConfiguration'
+              - 's3:GetBucketLocation'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+              - 's3:ListBucketVersions'
+              - 's3:GetBucketCORS'
+              - 's3:PutBucketCORS'
+            Resource: '*'
+          - Sid: IamRoleAndPolicyManagement
+            Effect: Allow
+            Action:
+              - 'iam:CreateRole'
+              - 'iam:DeleteRole'
+              - 'iam:GetRole'
+              - 'iam:UpdateRole'
+              - 'iam:TagRole'
+              - 'iam:UntagRole'
+              - 'iam:ListRoleTags'
+              - 'iam:PutRolePolicy'
+              - 'iam:DeleteRolePolicy'
+              - 'iam:GetRolePolicy'
+              - 'iam:ListRolePolicies'
+              - 'iam:AttachRolePolicy'
+              - 'iam:DetachRolePolicy'
+              - 'iam:ListAttachedRolePolicies'
+              - 'iam:PassRole'
+              - 'iam:ListInstanceProfilesForRole'
+              - 'iam:UpdateAssumeRolePolicy'
+              - 'iam:CreatePolicy'
+              - 'iam:DeletePolicy'
+              - 'iam:GetPolicy'
+              - 'iam:ListPolicyVersions'
+              - 'iam:CreatePolicyVersion'
+              - 'iam:DeletePolicyVersion'
+              - 'iam:GetPolicyVersion'
+              - 'iam:SetDefaultPolicyVersion'
+              - 'iam:TagPolicy'
+              - 'iam:UntagPolicy'
+            Resource: '*'
+          - Sid: IamServiceLinkedRoles
+            Effect: Allow
+            Action:
+              - 'iam:CreateServiceLinkedRole'
+            Resource:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.amazonaws.com/*'
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/elasticloadbalancing.amazonaws.com/*'
+          - Sid: CodePipelineManagement
+            Effect: Allow
+            Action:
+              - 'codepipeline:CreatePipeline'
+              - 'codepipeline:UpdatePipeline'
+              - 'codepipeline:DeletePipeline'
+              - 'codepipeline:GetPipeline'
+              - 'codepipeline:GetPipelineState'
+              - 'codepipeline:ListTagsForResource'
+              - 'codepipeline:TagResource'
+              - 'codepipeline:UntagResource'
+            Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:*'
+
+  # --- Git Sync Role ---
+
+  StorrGitSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StorrGitSyncRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.sync.codeconnections.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      ManagedPolicyArns:
+        - !Ref StorrCoreServicesPolicy
+        - !Ref StorrNetworkAndComputePolicy
+        - !Ref StorrDataAndAppPolicy
+        - !Ref StorrDeliveryAndObservabilityPolicy
+      Policies:
+        - PolicyName: StorrScopedResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SsmParameterManagement
+                Effect: Allow
+                Action:
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParameter'
+                  - 'ssm:PutParameter'
+                  - 'ssm:DeleteParameter'
+                  - 'ssm:AddTagsToResource'
+                  - 'ssm:RemoveTagsFromResource'
+                  - 'ssm:ListTagsForResource'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/storr/*'
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+              - Sid: LogsManagement
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:DeleteLogGroup'
+                  - 'logs:PutRetentionPolicy'
+                  - 'logs:ListTagsForResource'
+                  - 'logs:TagResource'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/storr-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/storr-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/storr-*'

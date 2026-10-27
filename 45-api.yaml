@@ -1,0 +1,467 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr API - Lambda function, API Gateway HTTP API, custom domain
+
+Parameters:
+  CorsOrigin:
+    Type: String
+    Default: https://app.storr.build
+    Description: Allowed CORS origin
+  DomainName:
+    Type: String
+    Default: api.storr.build
+    Description: Custom domain for the API
+  BatchUpdateMaxProducts:
+    Type: String
+    Default: '25'
+    Description: Maximum number of products allowed in a single batch update request
+
+Resources:
+
+  # --- IAM Role ---
+
+  ApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: ApiLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${ApiLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - '{{resolve:ssm:/storr/dynamodb/stores-table-arn}}'
+                  - !Sub
+                    - '${TableArn}/index/*'
+                    - TableArn: '{{resolve:ssm:/storr/dynamodb/stores-table-arn}}'
+                  - '{{resolve:ssm:/storr/dynamodb/oauth-states-table-arn}}'
+                  - !Sub
+                    - '${TableArn}/index/*'
+                    - TableArn: '{{resolve:ssm:/storr/dynamodb/oauth-states-table-arn}}'
+                  - '{{resolve:ssm:/storr/dynamodb/products-table-arn}}'
+                  - !Sub
+                    - '${TableArn}/index/*'
+                    - TableArn: '{{resolve:ssm:/storr/dynamodb/products-table-arn}}'
+                  - '{{resolve:ssm:/storr/dynamodb/webhook-events-table-arn}}'
+                  - !Sub
+                    - '${TableArn}/index/*'
+                    - TableArn: '{{resolve:ssm:/storr/dynamodb/webhook-events-table-arn}}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - '{{resolve:ssm:/storr/s3/product-images-bucket-arn}}'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: '{{resolve:ssm:/storr/s3/product-images-bucket-arn}}'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:SignUp
+                  - cognito-idp:AdminConfirmSignUp
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:GetUser
+                Resource: '{{resolve:ssm:/storr/cognito/user-pool-arn}}'
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/storr-*'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                  - ecs:TagResource
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*'
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - '{{resolve:ssm:/storr/iam/studio-execution-role-arn}}'
+                  - '{{resolve:ssm:/storr/iam/studio-task-role-arn}}'
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:CreateAccessPoint
+                  - elasticfilesystem:DescribeAccessPoints
+                  - elasticfilesystem:TagResource
+                Resource:
+                  - '{{resolve:ssm:/storr/efs/filesystem-arn}}'
+                  - !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                Resource: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*/*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                  - elasticloadbalancing:ModifyRule
+                Resource:
+                  - '{{resolve:ssm:/storr/alb/listener-arn}}'
+                  - !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeRules
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/storr/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:storr/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '{{resolve:ssm:/storr/kms/key-arn}}'
+
+  # --- Lambda Placeholder Seed ---
+
+  SeedApiPlaceholderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-seed-api-placeholder
+      RetentionInDays: 7
+
+  SeedApiPlaceholderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: SeedApiPlaceholderAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub
+                  - '${BucketArn}/storr-api-placeholder.zip'
+                  - BucketArn: '{{resolve:ssm:/storr/s3/eve-source-bucket-arn}}'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: '{{resolve:ssm:/storr/s3/eve-source-bucket-arn}}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${SeedApiPlaceholderLogGroup.Arn}:*'
+
+  SeedApiPlaceholderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SeedApiPlaceholderRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SeedApiPlaceholderLogGroup
+      Code:
+        ZipFile: |
+          const { S3Client, PutObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+          const https = require("https");
+          const url = require("url");
+
+          const PLACEHOLDER_ZIP_BASE64 = "UEsDBAoAAAAAABinR11kNINPEQAAABEAAAAJABwAYm9vdHN0cmFwVVQJAANP6sZqT+rGanV4CwABBPUBAAAEAAAAACNcIS9iaW4vc2gKZXhpdCAwUEsBAh4DCgAAAAAAGKdHXWQ0g08RAAAAEQAAAAkAGAAAAAAAAQAAAO2BAAAAAGJvb3RzdHJhcFVUBQADT+rGanV4CwABBPUBAAAEAAAAAFBLBQYAAAAAAQABAE8AAABUAAAAAAA=";
+          const S3_KEY = "storr-api-placeholder.zip";
+
+          function sendResponse(event, context, status, reason) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: reason || `See CloudWatch Log Stream: ${context.logStreamName}`,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+            });
+            const parsed = url.parse(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: parsed.hostname,
+                port: 443,
+                path: parsed.path,
+                method: "PUT",
+                headers: { "Content-Type": "", "Content-Length": body.length },
+              }, (res) => resolve());
+              req.on("error", reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event, context) => {
+            const bucket = event.ResourceProperties.BucketName;
+            const s3 = new S3Client();
+            if (event.RequestType === "Update") {
+              return sendResponse(event, context, "SUCCESS");
+            }
+            if (event.RequestType === "Delete") {
+              try {
+                await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: S3_KEY }));
+                console.log("Deleted placeholder zip from S3");
+              } catch (e) {
+                console.log("Cleanup failed, continuing:", e.message);
+              }
+              return sendResponse(event, context, "SUCCESS");
+            }
+            const MAX_ATTEMPTS = 4;
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+              try {
+                try {
+                  await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: S3_KEY }));
+                  console.log("Placeholder zip already exists, skipping upload");
+                  return sendResponse(event, context, "SUCCESS");
+                } catch (e) {
+                  if (e.$metadata?.httpStatusCode !== 404) throw e;
+                }
+                const zipBuffer = Buffer.from(PLACEHOLDER_ZIP_BASE64, "base64");
+                await s3.send(new PutObjectCommand({ Bucket: bucket, Key: S3_KEY, Body: zipBuffer }));
+                console.log("Uploaded placeholder zip to S3");
+                return sendResponse(event, context, "SUCCESS");
+              } catch (e) {
+                if (attempt < MAX_ATTEMPTS) {
+                  const delay = 3000 * attempt;
+                  console.log("Attempt " + attempt + " failed, retrying in " + delay + "ms:", e.message);
+                  await new Promise(function(r) { setTimeout(r, delay); });
+                  continue;
+                }
+                console.error("All attempts failed:", e);
+                return sendResponse(event, context, "FAILED", e.message);
+              }
+            }
+          };
+
+  SeedApiPlaceholder:
+    Type: Custom::SeedS3Object
+    DependsOn: SeedApiPlaceholderLogGroup
+    Properties:
+      ServiceToken: !GetAtt SeedApiPlaceholderFunction.Arn
+      BucketName: '{{resolve:ssm:/storr/s3/eve-source-bucket-name}}'
+
+  # --- Lambda Function ---
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-api
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ApiLogGroup
+      - SeedApiPlaceholder
+    Properties:
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Handler: bootstrap
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt ApiLambdaRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Code:
+        S3Bucket: '{{resolve:ssm:/storr/s3/eve-source-bucket-name}}'
+        S3Key: storr-api-placeholder.zip
+      Environment:
+        Variables:
+          STORES_TABLE: '{{resolve:ssm:/storr/dynamodb/stores-table}}'
+          COGNITO_USER_POOL_ID: '{{resolve:ssm:/storr/cognito/user-pool-id}}'
+          COGNITO_CLIENT_ID: '{{resolve:ssm:/storr/cognito/client-id}}'
+          CORS_ORIGIN: !Ref CorsOrigin
+          STUDIO_CLUSTER: '{{resolve:ssm:/storr/ecs/cluster-name}}'
+          STUDIO_TASK_DEFINITION: storr-studio
+          STUDIO_SUBNETS: '{{resolve:ssm:/storr/ecs/subnet-ids}}'
+          STUDIO_SECURITY_GROUP: '{{resolve:ssm:/storr/ecs/fargate-sg}}'
+          STUDIO_EFS_FILESYSTEM_ID: '{{resolve:ssm:/storr/efs/filesystem-id}}'
+          RUNTIME_AUTH_SECRET_ARN: '{{resolve:ssm:/storr/secrets/runtime-auth-arn}}'
+          STUDIO_ALB_LISTENER_ARN: '{{resolve:ssm:/storr/alb/listener-arn}}'
+          STUDIO_VPC_ID: '{{resolve:ssm:/storr/vpc/id}}'
+          THEME_TASK_DEFINITION: storr-studio
+          PIPELINE_TASK_DEFINITION: storr-pipeline
+          ANTHROPIC_SECRET_ARN: '{{resolve:ssm:/storr/secrets/anthropic-arn}}'
+          LLM_MODEL: '{{resolve:ssm:/storr/llm-model}}'
+          LLM_PROVIDER: '{{resolve:ssm:/storr/llm-provider}}'
+          OAUTH_STATES_TABLE: '{{resolve:ssm:/storr/dynamodb/oauth-states-table}}'
+          FRONTEND_URL: !Ref CorsOrigin
+          FIGMA_SECRET_ARN: '{{resolve:ssm:/storr/secrets/figma-arn}}'
+          FIGMA_REDIRECT_URI: '{{resolve:ssm:/storr/figma-redirect-uri}}'
+          SHOPIFY_SECRET_ARN: '{{resolve:ssm:/storr/secrets/shopify-arn}}'
+          SHOPIFY_REDIRECT_URI: '{{resolve:ssm:/storr/shopify-redirect-uri}}'
+          EVE_REPO_URL: https://github.com/iJKTen/eve.git
+          PRODUCTS_TABLE: '{{resolve:ssm:/storr/dynamodb/products-table}}'
+          PRODUCT_IMAGES_BUCKET: '{{resolve:ssm:/storr/s3/product-images-bucket-name}}'
+          WEBHOOK_EVENTS_TABLE: '{{resolve:ssm:/storr/dynamodb/webhook-events-table}}'
+          BATCH_UPDATE_MAX_PRODUCTS: !Ref BatchUpdateMaxProducts
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- API Gateway HTTP API ---
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: storr-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Requested-With
+        AllowCredentials: true
+        MaxAge: 300
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '1.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /{proxy+}
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # --- Custom Domain ---
+
+  ApiCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: '{{resolve:ssm:/storr/acm/cert-arn}}'
+
+  ApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: '{{resolve:ssm:/storr/acm/hosted-zone-id}}'
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+
+  ApiDnsRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: '{{resolve:ssm:/storr/acm/hosted-zone-id}}'
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: HttpApiStage
+    Properties:
+      DomainName: !Ref ApiCustomDomain
+      ApiId: !Ref HttpApi
+      Stage: !Ref HttpApiStage
+
+  # --- SSM Parameters ---
+
+  ApiUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/api/url
+      Type: String
+      Value: !Sub 'https://${DomainName}'
+
+  ApiFunctionNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/api/function-name
+      Type: String
+      Value: !Ref ApiFunction
+
+  ApiFunctionArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/api/function-arn
+      Type: String
+      Value: !GetAtt ApiFunction.Arn

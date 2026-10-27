@@ -1,0 +1,3 @@
+template-file-path: 05-foundation.yaml
+parameters:
+  StorrBuildHostedZoneId: Z08719331LNFPKO1PP221

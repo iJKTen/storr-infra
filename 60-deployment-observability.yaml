@@ -1,0 +1,3 @@
+template-file-path: 60-observability.yaml
+parameters:
+  AlertEmail: PLACEHOLDER

@@ -1,0 +1,606 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr services - ECS cluster, ALB, task definitions, IAM roles, DNS
+
+Parameters:
+  IdleTimeoutMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: Minutes of inactivity before auto-shutdown of studio environments
+
+Resources:
+
+  # --- ECS Cluster ---
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- Application Load Balancer ---
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - '{{resolve:ssm:/storr/subnet/public-a}}'
+        - '{{resolve:ssm:/storr/subnet/public-b}}'
+      SecurityGroups:
+        - '{{resolve:ssm:/storr/sg/alb}}'
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- WAFv2 WebACL ---
+
+  AlbWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: StorrAlbWebAcl
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+        - Name: RateLimitRule
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+      Tags:
+        - Key: Project
+          Value: storr
+
+  AlbWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      WebACLArn: !GetAtt AlbWebAcl.Arn
+      ResourceArn: !Ref Alb
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: '{{resolve:ssm:/storr/acm/cert-arn}}'
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '503'
+            ContentType: text/plain
+            MessageBody: Preview environment not running
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            StatusCode: HTTP_301
+
+  # --- Cleanup on Stack Deletion ---
+
+  CleanupServicesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-cleanup-services
+      RetentionInDays: 7
+
+  CleanupServicesPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecs:ListTasks
+            Resource: !GetAtt EcsCluster.Arn
+          - Effect: Allow
+            Action:
+              - ecs:StopTask
+              - ecs:DescribeTasks
+            Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeTargetGroups
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DeleteRule
+            Resource:
+              - !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/*'
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DeleteTargetGroup
+            Resource: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/*/*'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub '${CleanupServicesLogGroup.Arn}:*'
+
+  CleanupServicesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      ManagedPolicyArns:
+        - !Ref CleanupServicesPolicy
+
+  CleanupServicesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt CleanupServicesRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref CleanupServicesLogGroup
+      Code:
+        ZipFile: |
+          const { ECSClient, ListTasksCommand, StopTaskCommand } = require("@aws-sdk/client-ecs");
+          const { ElasticLoadBalancingV2Client, DescribeRulesCommand, DeleteRuleCommand, DescribeTargetGroupsCommand, DeleteTargetGroupCommand } = require("@aws-sdk/client-elastic-load-balancing-v2");
+          const https = require("https");
+          const url = require("url");
+
+          function sendResponse(event, context, status, reason) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: reason || `See CloudWatch Log Stream: ${context.logStreamName}`,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+            });
+            const parsed = url.parse(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: parsed.hostname,
+                port: 443,
+                path: parsed.path,
+                method: "PUT",
+                headers: { "Content-Type": "", "Content-Length": body.length },
+              }, (res) => resolve());
+              req.on("error", reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event, context) => {
+            if (event.RequestType !== "Delete") {
+              return sendResponse(event, context, "SUCCESS");
+            }
+            const { ClusterArn, ListenerArn, AlbArn } = event.ResourceProperties;
+            const ecs = new ECSClient();
+            const elbv2 = new ElasticLoadBalancingV2Client();
+
+            // Phase 1: Stop all running ECS tasks
+            try {
+              let nextToken;
+              do {
+                const resp = await ecs.send(new ListTasksCommand({
+                  cluster: ClusterArn, desiredStatus: "RUNNING", nextToken,
+                }));
+                for (const taskArn of (resp.taskArns || [])) {
+                  try {
+                    await ecs.send(new StopTaskCommand({ cluster: ClusterArn, task: taskArn, reason: "Stack deletion cleanup" }));
+                    console.log("Stopped task:", taskArn);
+                  } catch (e) {
+                    console.log("Failed to stop task:", taskArn, e.message);
+                  }
+                }
+                nextToken = resp.nextToken;
+              } while (nextToken);
+            } catch (e) {
+              console.log("Failed to list ECS tasks:", e.message);
+            }
+
+            // Phase 2: Delete non-default listener rules
+            try {
+              const resp = await elbv2.send(new DescribeRulesCommand({ ListenerArn: ListenerArn }));
+              for (const rule of (resp.Rules || [])) {
+                if (rule.IsDefault) continue;
+                try {
+                  await elbv2.send(new DeleteRuleCommand({ RuleArn: rule.RuleArn }));
+                  console.log("Deleted rule:", rule.RuleArn);
+                } catch (e) {
+                  console.log("Failed to delete rule:", rule.RuleArn, e.message);
+                }
+              }
+            } catch (e) {
+              console.log("Failed to describe listener rules:", e.message);
+            }
+
+            // Phase 3: Delete target groups associated with the ALB
+            try {
+              let marker;
+              do {
+                const resp = await elbv2.send(new DescribeTargetGroupsCommand({
+                  LoadBalancerArn: AlbArn, Marker: marker,
+                }));
+                for (const tg of (resp.TargetGroups || [])) {
+                  try {
+                    await elbv2.send(new DeleteTargetGroupCommand({ TargetGroupArn: tg.TargetGroupArn }));
+                    console.log("Deleted target group:", tg.TargetGroupArn);
+                  } catch (e) {
+                    console.log("Failed to delete target group:", tg.TargetGroupArn, e.message);
+                  }
+                }
+                marker = resp.NextMarker;
+              } while (marker);
+            } catch (e) {
+              console.log("Failed to describe target groups:", e.message);
+            }
+
+            return sendResponse(event, context, "SUCCESS");
+          };
+
+  CleanupServicesOnDelete:
+    Type: Custom::CleanupServices
+    DependsOn: CleanupServicesLogGroup
+    Properties:
+      ServiceToken: !GetAtt CleanupServicesFunction.Arn
+      ClusterArn: !GetAtt EcsCluster.Arn
+      ListenerArn: !Ref HttpsListener
+      AlbArn: !Ref Alb
+
+  # --- DNS ---
+
+  PreviewDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: '{{resolve:ssm:/storr/acm/hosted-zone-id}}'
+      Name: '*.preview.storr.build'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+
+  PreviewDnsRecordIpv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: '{{resolve:ssm:/storr/acm/hosted-zone-id}}'
+      Name: '*.preview.storr.build'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+
+  # --- Log Groups ---
+
+  StudioLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/storr-studio
+      RetentionInDays: 7
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/storr-pipeline
+      RetentionInDays: 7
+
+  PreviewRuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/storr-preview-runtime
+      RetentionInDays: 7
+
+  # --- IAM Roles ---
+
+  StudioExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameters
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/storr/*'
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:storr/*'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: '{{resolve:ssm:/storr/kms/key-arn}}'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub '${StudioLogGroup.Arn}:*'
+              - !Sub '${PipelineLogGroup.Arn}:*'
+
+  StudioExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - !Ref StudioExecutionPolicy
+
+  StudioTaskPermissionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+            Resource: '{{resolve:ssm:/storr/efs/filesystem-arn}}'
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub
+              - '${BucketArn}/*'
+              - BucketArn: '{{resolve:ssm:/storr/s3/eve-source-bucket-arn}}'
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub '${PreviewRuntimeLogGroup.Arn}:*'
+
+  StudioTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      ManagedPolicyArns:
+        - !Ref StudioTaskPermissionsPolicy
+
+  # --- Task Definitions ---
+
+  StudioTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: storr-studio
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt StudioExecutionRole.Arn
+      TaskRoleArn: !GetAtt StudioTaskRole.Arn
+      ContainerDefinitions:
+        - Name: studio-env
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/storr-studio:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+            - ContainerPort: 9292
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: IDLE_TIMEOUT_MINUTES
+              Value: !Ref IdleTimeoutMinutes
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref StudioLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Secrets:
+            - Name: RUNTIME_AUTH_TOKEN
+              ValueFrom: '{{resolve:ssm:/storr/secrets/runtime-auth-arn}}:token::'
+          MountPoints:
+            - ContainerPath: /home/node/app
+              SourceVolume: studio-storage
+      Volumes:
+        - Name: studio-storage
+          EFSVolumeConfiguration:
+            FilesystemId: '{{resolve:ssm:/storr/efs/filesystem-id}}'
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: ENABLED
+
+  PipelineTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: storr-pipeline
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '1024'
+      Memory: '4096'
+      ExecutionRoleArn: !GetAtt StudioExecutionRole.Arn
+      TaskRoleArn: !GetAtt StudioTaskRole.Arn
+      ContainerDefinitions:
+        - Name: pipeline-env
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/storr-pipeline:latest'
+          Essential: true
+          LinuxParameters:
+            InitProcessEnabled: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+            - ContainerPort: 9292
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: SOURCE_S3_BUCKET
+              Value: '{{resolve:ssm:/storr/s3/eve-source-bucket-name}}'
+            - Name: SOURCE_S3_KEY
+              Value: eve-source.zip
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PipelineLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Secrets:
+            - Name: RUNTIME_AUTH_TOKEN
+              ValueFrom: '{{resolve:ssm:/storr/secrets/runtime-auth-arn}}:token::'
+
+  # --- SSM Parameters ---
+
+  EcsClusterNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/cluster-name
+      Type: String
+      Value: !Ref EcsCluster
+
+  EcsClusterArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/cluster-arn
+      Type: String
+      Value: !GetAtt EcsCluster.Arn
+
+  AlbArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/alb/arn
+      Type: String
+      Value: !Ref Alb
+
+  AlbDnsNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/alb/dns-name
+      Type: String
+      Value: !GetAtt Alb.DNSName
+
+  AlbListenerArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/alb/listener-arn
+      Type: String
+      Value: !Ref HttpsListener
+
+  AlbFullNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/alb/full-name
+      Type: String
+      Value: !GetAtt Alb.LoadBalancerFullName
+
+  FargateSgParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/fargate-sg
+      Type: String
+      Value: '{{resolve:ssm:/storr/sg/fargate}}'
+
+  SubnetIdsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/subnet-ids
+      Type: String
+      Value: !Sub
+        - '${SubnetA},${SubnetB}'
+        - SubnetA: '{{resolve:ssm:/storr/subnet/public-a}}'
+          SubnetB: '{{resolve:ssm:/storr/subnet/public-b}}'
+
+  StudioExecutionRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/iam/studio-execution-role-arn
+      Type: String
+      Value: !GetAtt StudioExecutionRole.Arn
+
+  StudioTaskRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/iam/studio-task-role-arn
+      Type: String
+      Value: !GetAtt StudioTaskRole.Arn
+
+  StudioTaskDefArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/studio-task-def-arn
+      Type: String
+      Value: !Ref StudioTaskDefinition
+
+  PipelineTaskDefArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/ecs/pipeline-task-def-arn
+      Type: String
+      Value: !Ref PipelineTaskDefinition

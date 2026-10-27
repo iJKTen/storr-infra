@@ -1,0 +1,1293 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr CI/CD - all CodePipelines and CodeBuild projects
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: iJKTen
+  GitHubBranch:
+    Type: String
+    Default: main
+
+Resources:
+
+  # --- Shared Artifact Bucket ---
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 3
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- Artifact Bucket Cleanup on Stack Deletion ---
+
+  EmptyArtifactBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-empty-artifact-bucket
+      RetentionInDays: 7
+
+  EmptyArtifactBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: EmptyBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${EmptyArtifactBucketLogGroup.Arn}:*'
+
+  EmptyArtifactBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt EmptyArtifactBucketRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EmptyArtifactBucketLogGroup
+      Code:
+        ZipFile: |
+          const { S3Client, ListObjectVersionsCommand, DeleteObjectsCommand } = require("@aws-sdk/client-s3");
+          const https = require("https");
+          const url = require("url");
+
+          function sendResponse(event, context, status, reason) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: reason || `See CloudWatch Log Stream: ${context.logStreamName}`,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+            });
+            const parsed = url.parse(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: parsed.hostname,
+                port: 443,
+                path: parsed.path,
+                method: "PUT",
+                headers: { "Content-Type": "", "Content-Length": body.length },
+              }, (res) => resolve());
+              req.on("error", reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event, context) => {
+            if (event.RequestType !== "Delete") {
+              return sendResponse(event, context, "SUCCESS");
+            }
+            try {
+              const bucket = event.ResourceProperties.BucketName;
+              const s3 = new S3Client();
+              let keyMarker, versionIdMarker;
+              do {
+                const resp = await s3.send(new ListObjectVersionsCommand({
+                  Bucket: bucket, KeyMarker: keyMarker, VersionIdMarker: versionIdMarker,
+                }));
+                const objects = [];
+                for (const v of (resp.Versions || [])) objects.push({ Key: v.Key, VersionId: v.VersionId });
+                for (const m of (resp.DeleteMarkers || [])) objects.push({ Key: m.Key, VersionId: m.VersionId });
+                if (objects.length > 0) {
+                  await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
+                }
+                keyMarker = resp.IsTruncated ? resp.NextKeyMarker : undefined;
+                versionIdMarker = resp.IsTruncated ? resp.NextVersionIdMarker : undefined;
+              } while (keyMarker);
+              return sendResponse(event, context, "SUCCESS");
+            } catch (e) {
+              console.error("Error emptying bucket:", e);
+              return sendResponse(event, context, "FAILED", e.message);
+            }
+          };
+
+  EmptyArtifactBucketOnDelete:
+    Type: Custom::EmptyS3Bucket
+    DependsOn: EmptyArtifactBucketLogGroup
+    Properties:
+      ServiceToken: !GetAtt EmptyArtifactBucketFunction.Arn
+      BucketName: !Ref PipelineArtifactBucket
+
+  # --- CodeBuild Log Groups ---
+
+  StorrApiGoBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-api-go-build
+      RetentionInDays: 7
+
+  StorrApiDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-api-deploy
+      RetentionInDays: 7
+
+  StorrAppBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-app-build
+      RetentionInDays: 7
+
+  StorrAppDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-app-deploy
+      RetentionInDays: 7
+
+  StorrRuntimeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-runtime-build
+      RetentionInDays: 7
+
+  StorrPipelineImageBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-pipeline-image-build
+      RetentionInDays: 7
+
+  StorrFigmaParserBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/storr-figma-parser-build
+      RetentionInDays: 7
+
+  # ==========================================================================
+  # 1. Storr API Pipeline - Go build + Lambda code update
+  # ==========================================================================
+
+  StorrApiGoBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrApiCodeBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrApiGoBuildLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref PipelineArtifactBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                golang: 1.25
+            build:
+              commands:
+                - go mod download
+                - mkdir -p out
+                - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -p 1 -o out/bootstrap ./cmd/storr-api
+            post_build:
+              commands:
+                - cd out && zip bootstrap.zip bootstrap
+          artifacts:
+            files:
+              - out/bootstrap.zip
+
+  StorrApiDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrApiDeployRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrApiDeployLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: LAMBDA_FUNCTION_NAME
+            Value: '{{resolve:ssm:/storr/api/function-name}}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - aws lambda update-function-code --function-name $LAMBDA_FUNCTION_NAME --zip-file fileb://out/bootstrap.zip
+
+  StorrApiPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StorrApiPipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-api'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: GoBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref StorrApiGoBuild
+        - Name: Deploy
+          Actions:
+            - Name: UpdateLambda
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref StorrApiDeploy
+
+  StorrApiPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrApiPipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt StorrApiGoBuild.Arn
+                  - !GetAtt StorrApiDeploy.Arn
+
+  StorrApiCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrApiCodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrApiGoBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+
+  StorrApiDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrApiDeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrApiDeployLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                Resource: '{{resolve:ssm:/storr/api/function-arn}}'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+
+  # ==========================================================================
+  # 2. Storr App Pipeline - React build + S3 deploy + CloudFront invalidation
+  # ==========================================================================
+
+  StorrAppBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrAppBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrAppBuildLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: VITE_API_URL
+            Value: https://api.storr.build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            base-directory: dist
+            files:
+              - '**/*'
+
+  StorrAppDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrAppDeployRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrAppDeployLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOY_BUCKET
+            Value: '{{resolve:ssm:/storr/s3/website-bucket-name}}'
+          - Name: CLOUDFRONT_DIST_ID
+            Value: '{{resolve:ssm:/storr/cloudfront/distribution-id}}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - aws s3 sync . s3://$DEPLOY_BUCKET --delete --cache-control "max-age=31536000,public,immutable" --exclude "index.html"
+                - aws s3 cp index.html s3://$DEPLOY_BUCKET/index.html --cache-control "max-age=0,no-cache,no-store,must-revalidate"
+            post_build:
+              commands:
+                - aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DIST_ID --paths "/*"
+
+  StorrAppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StorrAppPipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-app'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: BuildApp
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref StorrAppBuild
+        - Name: Deploy
+          Actions:
+            - Name: S3Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref StorrAppDeploy
+
+  StorrAppPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrAppPipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt StorrAppBuild.Arn
+                  - !GetAtt StorrAppDeploy.Arn
+
+  StorrAppBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrAppBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrAppBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+
+  StorrAppDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrAppDeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrAppDeployLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: '{{resolve:ssm:/storr/s3/website-bucket-name}}'
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: '{{resolve:ssm:/storr/s3/website-bucket-name}}'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub
+                  - 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${DistId}'
+                  - DistId: '{{resolve:ssm:/storr/cloudfront/distribution-id}}'
+
+  # ==========================================================================
+  # 3. Storr Runtime Pipeline - Docker build + push to storr-studio ECR
+  # ==========================================================================
+
+  StorrRuntimeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrRuntimeBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrRuntimeBuildLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: '{{resolve:ssm:/storr/ecr/studio-repo-uri}}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - mkdir -p ~/.docker
+                - echo '{"credsStore":"ecr-login"}' > ~/.docker/config.json
+                - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+            build:
+              commands:
+                - echo Building the Docker image...
+                - docker build -t $REPOSITORY_URI:latest .
+                - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Pushing the Docker image...
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - printf '[{"name":"studio-env","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files: imagedefinitions.json
+
+  StorrRuntimePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StorrRuntimePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-runtime'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: DockerBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref StorrRuntimeBuild
+
+  StorrRuntimePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrRuntimePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt StorrRuntimeBuild.Arn
+
+  StorrRuntimeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrRuntimeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrRuntimeBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: '{{resolve:ssm:/storr/ecr/studio-repo-arn}}'
+
+  # ==========================================================================
+  # 4. Storr Pipeline Image Pipeline - 4-source Docker build
+  # ==========================================================================
+
+  StorrPipelineImageBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrPipelineImageBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrPipelineImageBuildLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: '{{resolve:ssm:/storr/ecr/pipeline-repo-uri}}'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - mkdir -p ~/.docker
+                - echo '{"credsStore":"ecr-login"}' > ~/.docker/config.json
+                - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - echo Assembling build context from multiple sources...
+                - cp -r $CODEBUILD_SRC_DIR_AgentArtifact ./agent
+                - mkdir -p ./rules
+                - cp -r $CODEBUILD_SRC_DIR_PromptArtifact/rules/* ./rules/ 2>/dev/null || true
+                - cp -r $CODEBUILD_SRC_DIR_FigmaParserArtifact ./figma-parser
+            build:
+              commands:
+                - echo Building the Docker image...
+                - docker build -t $REPOSITORY_URI:latest .
+                - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Pushing the Docker image...
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - printf '[{"name":"pipeline-env","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files: imagedefinitions.json
+
+  StorrPipelineImagePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StorrPipelineImagePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: PipelineSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: PipelineArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-pipeline'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+            - Name: AgentSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: AgentArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-agent'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+            - Name: PromptSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: PromptArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-prompt'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+            - Name: FigmaParserSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: FigmaParserArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-figma-parser'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: DockerBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: PipelineArtifact
+                - Name: AgentArtifact
+                - Name: PromptArtifact
+                - Name: FigmaParserArtifact
+              Configuration:
+                ProjectName: !Ref StorrPipelineImageBuild
+                PrimarySource: PipelineArtifact
+
+  StorrPipelineImagePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrPipelineImagePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt StorrPipelineImageBuild.Arn
+
+  StorrPipelineImageBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrPipelineImageBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrPipelineImageBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: '{{resolve:ssm:/storr/ecr/pipeline-repo-arn}}'
+
+  # ==========================================================================
+  # 5. Eve Source Pipeline - S3 sync from iJKTen/eve
+  # ==========================================================================
+
+  EveSourcePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt EveSourcePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: EveSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: EveArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/eve'
+                BranchName: main
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Deploy
+          Actions:
+            - Name: S3Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              InputArtifacts:
+                - Name: EveArtifact
+              Configuration:
+                BucketName: '{{resolve:ssm:/storr/s3/eve-source-bucket-name}}'
+                Extract: 'false'
+                ObjectKey: eve-source.zip
+
+  EveSourcePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: EveSourcePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: '{{resolve:ssm:/storr/s3/eve-source-bucket-arn}}'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+
+  # ==========================================================================
+  # 6. Storr Figma Parser Pipeline - npm build + CodeArtifact publish
+  # ==========================================================================
+
+  StorrFigmaParserBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt StorrFigmaParserBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref StorrFigmaParserBuildLogGroup
+          Status: ENABLED
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+            pre_build:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build --workspaces
+            post_build:
+              commands:
+                - aws codeartifact login --tool npm --domain jaik --repository storr
+                - npm publish --workspaces --no-git-checks || true
+
+  StorrFigmaParserPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt StorrFigmaParserPipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/storr-figma-parser'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+        - Name: Build
+          Actions:
+            - Name: NpmBuildAndPublish
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ProjectName: !Ref StorrFigmaParserBuild
+
+  StorrFigmaParserPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrFigmaParserPipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: codestar-connections:UseConnection
+                Resource: !ImportValue GlobalResourcesStack-GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt StorrFigmaParserBuild.Arn
+
+  StorrFigmaParserBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: StorrFigmaParserBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${StorrFigmaParserBuildLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+                  - !GetAtt PipelineArtifactBucket.Arn
+              - Effect: Allow
+                Action:
+                  - codeartifact:GetAuthorizationToken
+                Resource: '{{resolve:ssm:/storr/codeartifact/domain-arn}}'
+              - Effect: Allow
+                Action:
+                  - codeartifact:GetRepositoryEndpoint
+                  - codeartifact:ReadFromRepository
+                Resource: '{{resolve:ssm:/storr/codeartifact/storr-repo-arn}}'
+              - Effect: Allow
+                Action:
+                  - codeartifact:PublishPackageVersion
+                  - codeartifact:PutPackageMetadata
+                  - codeartifact:PutPackageOriginConfiguration
+                Resource: !Sub 'arn:aws:codeartifact:${AWS::Region}:${AWS::AccountId}:package/jaik/storr/npm/*'
+              - Effect: Allow
+                Action:
+                  - sts:GetServiceBearerToken
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    sts:AWSServiceName: codeartifact.amazonaws.com

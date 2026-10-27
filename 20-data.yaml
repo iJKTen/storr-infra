@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr data — DynamoDB tables and Cognito user pool
+
+Resources:
+
+  # --- Cognito ---
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
+
+  # --- DynamoDB Tables ---
+
+  StoresTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: storeId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: storeId
+          KeyType: RANGE
+
+  OAuthStatesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: state
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: storeId
+          AttributeType: S
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: shopifyId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: storeId
+          KeyType: HASH
+        - AttributeName: productId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: shopifyId-index
+          KeySchema:
+            - AttributeName: storeId
+              KeyType: HASH
+            - AttributeName: shopifyId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  WebhookEventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # --- SSM Parameters ---
+
+  CognitoUserPoolIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/cognito/user-pool-id
+      Type: String
+      Value: !Ref CognitoUserPool
+
+  CognitoUserPoolArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/cognito/user-pool-arn
+      Type: String
+      Value: !GetAtt CognitoUserPool.Arn
+
+  CognitoClientIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/cognito/client-id
+      Type: String
+      Value: !Ref CognitoUserPoolClient
+
+  StoresTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/stores-table
+      Type: String
+      Value: !Ref StoresTable
+
+  StoresTableArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/stores-table-arn
+      Type: String
+      Value: !GetAtt StoresTable.Arn
+
+  OAuthStatesTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/oauth-states-table
+      Type: String
+      Value: !Ref OAuthStatesTable
+
+  OAuthStatesTableArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/oauth-states-table-arn
+      Type: String
+      Value: !GetAtt OAuthStatesTable.Arn
+
+  ProductsTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/products-table
+      Type: String
+      Value: !Ref ProductsTable
+
+  ProductsTableArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/products-table-arn
+      Type: String
+      Value: !GetAtt ProductsTable.Arn
+
+  WebhookEventsTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/webhook-events-table
+      Type: String
+      Value: !Ref WebhookEventsTable
+
+  WebhookEventsTableArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/dynamodb/webhook-events-table-arn
+      Type: String
+      Value: !GetAtt WebhookEventsTable.Arn

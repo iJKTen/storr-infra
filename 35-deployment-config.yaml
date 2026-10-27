@@ -1,0 +1,6 @@
+template-file-path: 35-config.yaml
+parameters:
+  FigmaRedirectUri: https://api.storr.build/oauth/figma/callback
+  ShopifyRedirectUri: https://api.storr.build/oauth/shopify/callback
+  LlmModel: claude-opus-5
+  LlmProvider: anthropic

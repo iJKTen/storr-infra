@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr storage - EFS filesystem with mount targets, S3 product-images bucket
+
+Parameters:
+  CorsOrigin:
+    Type: String
+    Default: https://app.storr.build
+    Description: Allowed CORS origin for product image uploads
+
+Resources:
+
+  # --- EFS ---
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemTags:
+        - Key: Name
+          Value: storr-efs
+        - Key: Project
+          Value: storr
+
+  EfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: '{{resolve:ssm:/storr/subnet/public-a}}'
+      SecurityGroups:
+        - '{{resolve:ssm:/storr/sg/efs}}'
+
+  # --- S3 Product Images ---
+
+  ProductImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - PUT
+              - GET
+            AllowedOrigins:
+              - !Ref CorsOrigin
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: ExpireOrphanedImages
+            Status: Enabled
+            Prefix: stores/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: storr
+
+  # --- Product Images Bucket Cleanup on Stack Deletion ---
+
+  EmptyProductImagesBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/storr-empty-product-images-bucket
+      RetentionInDays: 7
+
+  EmptyProductImagesBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Sub '${AWS::AccountId}'
+      Policies:
+        - PolicyName: EmptyBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt ProductImagesBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${ProductImagesBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${EmptyProductImagesBucketLogGroup.Arn}:*'
+
+  EmptyProductImagesBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt EmptyProductImagesBucketRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EmptyProductImagesBucketLogGroup
+      Code:
+        ZipFile: |
+          const { S3Client, ListObjectVersionsCommand, DeleteObjectsCommand } = require("@aws-sdk/client-s3");
+          const https = require("https");
+          const url = require("url");
+
+          function sendResponse(event, context, status, reason) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: reason || `See CloudWatch Log Stream: ${context.logStreamName}`,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+            });
+            const parsed = url.parse(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: parsed.hostname,
+                port: 443,
+                path: parsed.path,
+                method: "PUT",
+                headers: { "Content-Type": "", "Content-Length": body.length },
+              }, (res) => resolve());
+              req.on("error", reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event, context) => {
+            if (event.RequestType !== "Delete") {
+              return sendResponse(event, context, "SUCCESS");
+            }
+            try {
+              const bucket = event.ResourceProperties.BucketName;
+              const s3 = new S3Client();
+              let keyMarker, versionIdMarker;
+              do {
+                const resp = await s3.send(new ListObjectVersionsCommand({
+                  Bucket: bucket, KeyMarker: keyMarker, VersionIdMarker: versionIdMarker,
+                }));
+                const objects = [];
+                for (const v of (resp.Versions || [])) objects.push({ Key: v.Key, VersionId: v.VersionId });
+                for (const m of (resp.DeleteMarkers || [])) objects.push({ Key: m.Key, VersionId: m.VersionId });
+                if (objects.length > 0) {
+                  await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects, Quiet: true } }));
+                }
+                keyMarker = resp.IsTruncated ? resp.NextKeyMarker : undefined;
+                versionIdMarker = resp.IsTruncated ? resp.NextVersionIdMarker : undefined;
+              } while (keyMarker);
+              return sendResponse(event, context, "SUCCESS");
+            } catch (e) {
+              console.error("Error emptying bucket:", e);
+              return sendResponse(event, context, "FAILED", e.message);
+            }
+          };
+
+  EmptyProductImagesBucketOnDelete:
+    Type: Custom::EmptyS3Bucket
+    DependsOn: EmptyProductImagesBucketLogGroup
+    Properties:
+      ServiceToken: !GetAtt EmptyProductImagesBucketFunction.Arn
+      BucketName: !Ref ProductImagesBucket
+
+  # --- SSM Parameters ---
+
+  EfsFileSystemIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/efs/filesystem-id
+      Type: String
+      Value: !Ref EfsFileSystem
+
+  EfsFileSystemArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/efs/filesystem-arn
+      Type: String
+      Value: !GetAtt EfsFileSystem.Arn
+
+  ProductImagesBucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/s3/product-images-bucket-name
+      Type: String
+      Value: !Ref ProductImagesBucket
+
+  ProductImagesBucketArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /storr/s3/product-images-bucket-arn
+      Type: String
+      Value: !GetAtt ProductImagesBucket.Arn

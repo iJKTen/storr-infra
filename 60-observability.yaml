@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Storr observability - CloudWatch alarms, SNS notifications, and dashboard
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address for alarm notifications
+
+Resources:
+
+  # --- SNS Topic ---
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: '{{resolve:ssm:/storr/kms/key-arn}}'
+      Tags:
+        - Key: Project
+          Value: storr
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # --- Alarms ---
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Storr API Lambda errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: '{{resolve:ssm:/storr/api/function-name}}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Storr ALB 5xx errors above threshold
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: '{{resolve:ssm:/storr/alb/full-name}}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # --- Dashboard ---
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "{{resolve:ssm:/storr/api/function-name}}", {"stat": "Sum"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "{{resolve:ssm:/storr/api/function-name}}", {"stat": "Sum"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "{{resolve:ssm:/storr/api/function-name}}", {"stat": "Average"}]
+                ],
+                "title": "Lambda - API",
+                "period": 300,
+                "region": "${AWS::Region}",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "{{resolve:ssm:/storr/alb/full-name}}", {"stat": "Sum"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "{{resolve:ssm:/storr/alb/full-name}}", {"stat": "Sum"}]
+                ],
+                "title": "ALB - Request Count & 5xx",
+                "period": 300,
+                "region": "${AWS::Region}",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "{{resolve:ssm:/storr/dynamodb/stores-table}}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "{{resolve:ssm:/storr/dynamodb/stores-table}}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "{{resolve:ssm:/storr/dynamodb/products-table}}", {"stat": "Sum"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "{{resolve:ssm:/storr/dynamodb/products-table}}", {"stat": "Sum"}]
+                ],
+                "title": "DynamoDB - Capacity",
+                "period": 300,
+                "region": "${AWS::Region}",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
